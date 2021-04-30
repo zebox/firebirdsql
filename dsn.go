@@ -47,13 +47,17 @@ func parseDSN(dsns string) (*firebirdDsn, error) {
 
 	dsn := newFirebirdDsn()
 
+	hasbang := strings.Contains(dsns, "#.")
+
 	if !strings.HasPrefix(dsns, "firebird://") {
 		dsns = "firebird://" + dsns
 	}
+
 	u, err := url.Parse(dsns)
 	if err != nil {
 		return nil, err
 	}
+
 	if u.User == nil {
 		return nil, ErrDsnUserUnknown
 	}
@@ -62,6 +66,9 @@ func parseDSN(dsns string) (*firebirdDsn, error) {
 	dsn.addr = u.Host
 	if !strings.ContainsRune(dsn.addr, ':') {
 		dsn.addr += ":3050"
+	}
+	if hasbang {
+		u.Path = u.Path + "#.FDB"
 	}
 	dsn.dbName = u.Path
 	if !strings.ContainsRune(dsn.dbName[1:], '/') {
