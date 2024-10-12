@@ -28,19 +28,25 @@ import (
 	"bytes"
 	"container/list"
 	"crypto/rc4"
+	"crypto/sha256"
 	"database/sql/driver"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"github.com/kardianos/osext"
+	"gitlab.com/nyarla/go-crypt"
+	"golang.org/x/crypto/chacha20"
+	"golang.org/x/text/encoding/charmap"
+	"golang.org/x/text/encoding/japanese"
+	"golang.org/x/text/encoding/korean"
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/encoding/traditionalchinese"
 	"math/big"
 	"net"
 	"os"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/kardianos/osext"
-	"github.com/pkg/errors"
-	"gitlab.com/nyarla/go-crypt"
 	//"unsafe"
 )
 
@@ -70,11 +76,14 @@ func _INFO_SQL_SELECT_DESCRIBE_VARS() []byte {
 }
 
 type wireChannel struct {
-	conn      net.Conn
-	reader    *bufio.Reader
-	writer    *bufio.Writer
-	rc4reader *rc4.Cipher
-	rc4writer *rc4.Cipher
+	conn           net.Conn
+	reader         *bufio.Reader
+	writer         *bufio.Writer
+	plugin         string
+	rc4reader      *rc4.Cipher
+	rc4writer      *rc4.Cipher
+	chacha20reader *chacha20.Cipher
+	chacha20writer *chacha20.Cipher
 }
 
 func newWireChannel(conn net.Conn) (wireChannel, error) {
@@ -87,26 +96,46 @@ func newWireChannel(conn net.Conn) (wireChannel, error) {
 	return *c, err
 }
 
-func (c *wireChannel) setAuthKey(key []byte) (err error) {
-	c.rc4reader, err = rc4.NewCipher(key)
-	c.rc4writer, err = rc4.NewCipher(key)
+func (c *wireChannel) setCryptKey(plugin string, sessionKey []byte, nonce []byte) (err error) {
+	c.plugin = plugin
+	if plugin == "ChaCha" {
+		digest := sha256.New()
+		digest.Write(sessionKey)
+		key := digest.Sum(nil)
+		c.chacha20reader, err = chacha20.NewUnauthenticatedCipher(key, nonce)
+		c.chacha20writer, err = chacha20.NewUnauthenticatedCipher(key, nonce)
+	} else if plugin == "Arc4" {
+		c.rc4reader, err = rc4.NewCipher(sessionKey)
+		c.rc4writer, err = rc4.NewCipher(sessionKey)
+	} else {
+		err = errors.New(fmt.Sprintf("Unknown wire encrypto plugin name:%s", plugin))
+	}
+
 	return
 }
 
 func (c *wireChannel) Read(buf []byte) (n int, err error) {
-	if c.rc4reader != nil {
+	if c.plugin != "" {
 		src := make([]byte, len(buf))
 		n, err = c.reader.Read(src)
-		c.rc4reader.XORKeyStream(buf, src[0:n])
+		if c.plugin == "ChaCha" {
+			c.chacha20reader.XORKeyStream(buf, src[0:n])
+		} else if c.plugin == "Arc4" {
+			c.rc4reader.XORKeyStream(buf, src[0:n])
+		}
 		return
 	}
 	return c.reader.Read(buf)
 }
 
 func (c *wireChannel) Write(buf []byte) (n int, err error) {
-	if c.rc4writer != nil {
+	if c.plugin != "" {
 		dst := make([]byte, len(buf))
-		c.rc4writer.XORKeyStream(dst, buf)
+		if c.plugin == "ChaCha" {
+			c.chacha20writer.XORKeyStream(dst, buf)
+		} else if c.plugin == "Arc4" {
+			c.rc4writer.XORKeyStream(dst, buf)
+		}
 		written := 0
 		for written < len(buf) {
 			n, err = c.writer.Write(dst[written:])
@@ -147,7 +176,8 @@ type wireProtocol struct {
 	password   string
 	authData   []byte
 
-	charset string
+	charset        string
+	charsetByteLen int
 
 	// Time Zone
 	timezone string
@@ -166,8 +196,23 @@ func newWireProtocol(addr string, timezone string, charset string) (*wireProtoco
 	p.conn, err = newWireChannel(conn)
 	p.timezone = timezone
 	p.charset = charset
+	p.charsetLen()
 
 	return p, err
+}
+
+// charsetLen sets the length of character depending the charset to get the correct size of column
+func (p *wireProtocol) charsetLen() {
+	// all ISO8859_X and WIN125X are 1 byte character length, so omit here
+	// only add charset that character length is > 1
+	switch p.charset {
+	case "UNICODE_FSS", "UTF8":
+		p.charsetByteLen = 4
+	case "BIG_5", "SJIS_0208", "KSC_5601", "EUCJ_0208", "GB_2312", "KOI8R", "KOI8U":
+		p.charsetByteLen = 2
+	default:
+		p.charsetByteLen = 1
+	}
 }
 
 func (p *wireProtocol) packInt(i int32) {
@@ -180,7 +225,7 @@ func (p *wireProtocol) packBytes(b []byte) {
 }
 
 func (p *wireProtocol) packString(s string) {
-	p.buf = append(p.buf, xdrBytes([]byte(s))...)
+	p.buf = append(p.buf, xdrBytes([]byte(p.encodeString(s)))...)
 }
 
 func (p *wireProtocol) appendBytes(bs []byte) {
@@ -316,7 +361,11 @@ func (p *wireProtocol) _parse_status_vector() (*list.List, int, string, error) {
 			gds_code = int(bytes_to_bint32(b))
 			if gds_code != 0 {
 				gds_codes.PushBack(gds_code)
-				message += errmsgs[gds_code]
+				if msg, ok := errmsgs[gds_code]; ok {
+					message += msg
+				} else {
+					message += fmt.Sprintf("unknown gds_code: %d", gds_code)
+				}
 				num_arg = 0
 			}
 		case n == isc_arg_number:
@@ -325,14 +374,14 @@ func (p *wireProtocol) _parse_status_vector() (*list.List, int, string, error) {
 			if gds_code == 335544436 {
 				sql_code = num
 			}
-			num_arg += 1
+			num_arg++
 			message = strings.Replace(message, "@"+strconv.Itoa(num_arg), strconv.Itoa(num), 1)
 		case n == isc_arg_string:
 			b, err = p.recvPackets(4)
 			nbytes := int(bytes_to_bint32(b))
 			b, err = p.recvPacketsAlignment(nbytes)
 			s := bytes_to_str(b)
-			num_arg += 1
+			num_arg++
 			message = strings.Replace(message, "@"+strconv.Itoa(num_arg), s, 1)
 		case n == isc_arg_interpreted:
 			b, err = p.recvPackets(4)
@@ -366,6 +415,27 @@ func (p *wireProtocol) _parse_op_response() (int32, []byte, []byte, error) {
 	}
 
 	return h, oid, buf, err
+}
+
+func (p *wireProtocol) _guess_wire_crypt(buf []byte) (string, []byte) {
+	params := map[byte][]byte{}
+	i := 0
+	for i = 0; i < len(buf); {
+		k := buf[i]
+		i++
+		ln := int(buf[i])
+		i++
+		v := buf[i : i+ln]
+		i += ln
+		params[k] = v
+	}
+	v, ok := params[3]
+	if ok {
+		if string(v[:7]) == "ChaCha\x00" {
+			return "ChaCha", v[7 : len(v)-4]
+		}
+	}
+	return "Arc4", nil
 }
 
 func (p *wireProtocol) _parse_connect_response(user string, password string, options map[string]string, clientPublic *big.Int, clientSecret *big.Int) (err error) {
@@ -423,7 +493,13 @@ func (p *wireProtocol) _parse_connect_response(user string, password string, opt
 				if len(data) == 0 {
 					p.opContAuth(bigIntToBytes(clientPublic), p.pluginName, PLUGIN_LIST, "")
 					b, _ := p.recvPackets(4)
-					if DEBUG_SRP && bytes_to_bint32(b) == op_cont_auth {
+					op := bytes_to_bint32(b)
+					if op == op_response {
+						_, _, _, err = p._parse_op_response() // error occurred
+						return
+					}
+
+					if DEBUG_SRP && op != op_cont_auth {
 						panic("auth error")
 					}
 
@@ -460,20 +536,25 @@ func (p *wireProtocol) _parse_connect_response(user string, password string, opt
 			}
 		}
 
+		var encrypt_plugin string
+		var nonce []byte
+
 		if opcode == op_cond_accept {
 			p.opContAuth(authData, options["auth_plugin_name"], PLUGIN_LIST, "")
-			_, _, _, err = p.opResponse()
+			var buf []byte
+			_, _, buf, err = p.opResponse()
 			if err != nil {
 				return
 			}
+			encrypt_plugin, nonce = p._guess_wire_crypt(buf)
 		}
 
 		wire_crypt := true
 		wire_crypt, _ = strconv.ParseBool(options["wire_crypt"])
 		if wire_crypt && sessionKey != nil {
 			// Send op_crypt
-			p.opCrypt()
-			p.conn.setAuthKey(sessionKey)
+			p.opCrypt(encrypt_plugin)
+			p.conn.setCryptKey(encrypt_plugin, sessionKey, nonce)
 			_, _, _, err = p.opResponse()
 			if err != nil {
 				return
@@ -527,6 +608,7 @@ func (p *wireProtocol) _parse_select_items(buf []byte, xsqlda []xSQLVAR) (int, e
 		case isc_info_sql_length:
 			ln = int(bytes_to_int16(buf[i : i+2]))
 			i += 2
+			// the length defined in buffer depends on character length of charset
 			xsqlda[index-1].sqllen = int(bytes_to_int32(buf[i : i+ln]))
 			i += ln
 		case isc_info_sql_null_ind:
@@ -575,7 +657,7 @@ func (p *wireProtocol) parse_xsqlda(buf []byte, stmtHandle int32) (int32, []xSQL
 
 	for i < len(buf) {
 		if buf[i] == byte(isc_info_sql_stmt_type) && buf[i+1] == byte(0x04) && buf[i+2] == byte(0x00) {
-			i += 1
+			i++
 			ln = int(bytes_to_int16(buf[i : i+2]))
 			i += 2
 			stmt_type = int32(bytes_to_int32(buf[i : i+ln]))
@@ -654,6 +736,10 @@ func (p *wireProtocol) opConnect(dbName string, user string, password string, op
 		"ffff800b00000001000000000000000500000004", // 11, 1, 0, 5, 4
 		"ffff800c00000001000000000000000500000006", // 12, 1, 0, 5, 6
 		"ffff800d00000001000000000000000500000008", // 13, 1, 0, 5, 8
+		"ffff800e0000000100000000000000050000000a", // 14, 1, 0, 5, 10
+		"ffff800f0000000100000000000000050000000c", // 15, 1, 0, 5, 12
+		"ffff80100000000100000000000000050000000e", // 16, 1, 0, 5, 14
+		"ffff801100000001000000000000000500000010", // 17, 1, 0, 5, 16
 	}
 	p.packInt(op_connect)
 	p.packInt(op_attach)
@@ -688,6 +774,7 @@ func (p *wireProtocol) opCreate(dbName string, user string, password string, rol
 		[]byte{isc_dpb_force_write, 4}, bint32_to_bytes(1),
 		[]byte{isc_dpb_overwrite, 4}, bint32_to_bytes(1),
 		[]byte{isc_dpb_page_size, 4}, int32_to_bytes(page_size),
+		[]byte{isc_dpb_utf8_filename, 1, 1},
 	}, nil)
 
 	if p.authData != nil {
@@ -739,6 +826,7 @@ func (p *wireProtocol) opAttach(dbName string, user string, password string, rol
 		[]byte{isc_dpb_sql_role_name, byte(len(roleBytes))}, roleBytes,
 		[]byte{isc_dpb_process_id, 4}, int32_to_bytes(pid),
 		[]byte{isc_dpb_process_name, byte(len(processNameBytes))}, processNameBytes,
+		[]byte{isc_dpb_utf8_filename, 1, 1},
 	}, nil)
 
 	if p.authData != nil {
@@ -773,10 +861,19 @@ func (p *wireProtocol) opContAuth(authData []byte, authPluginName string, authPl
 	return err
 }
 
-func (p *wireProtocol) opCrypt() error {
+func (p *wireProtocol) opCrypt(plugin string) error {
 	p.packInt(op_crypt)
-	p.packString("Arc4")
+	p.packString(plugin)
 	p.packString("Symmetric")
+	_, err := p.sendPackets()
+	return err
+}
+
+func (p *wireProtocol) opCryptCallback() error {
+	p.debugPrint("opCryptCallback")
+	p.packInt(op_crypt_key_callback)
+	p.packInt(0)
+	p.packInt(int32(BUFFER_LEN))
 	_, err := p.sendPackets()
 	return err
 }
@@ -915,6 +1012,10 @@ func (p *wireProtocol) opExecute(stmtHandle int32, transHandle int32, params []d
 		p.packInt(1)
 		p.appendBytes(values)
 	}
+	if p.protocolVersion >= PROTOCOL_VERSION16 {
+		// statement timeout
+		p.appendBytes(bint32_to_bytes(0))
+	}
 	_, err := p.sendPackets()
 	return err
 }
@@ -939,6 +1040,12 @@ func (p *wireProtocol) opExecute2(stmtHandle int32, transHandle int32, params []
 
 	p.packBytes(outputBlr)
 	p.packInt(0)
+
+	if p.protocolVersion >= PROTOCOL_VERSION16 {
+		// statement timeout
+		p.appendBytes(bint32_to_bytes(0))
+	}
+
 	_, err := p.sendPackets()
 	return err
 }
@@ -1123,6 +1230,17 @@ func (p *wireProtocol) opResponse() (int32, []byte, []byte, error) {
 	for bytes_to_bint32(b) == op_dummy {
 		b, _ = p.recvPackets(4)
 	}
+	for bytes_to_bint32(b) == op_crypt_key_callback {
+
+		err = p.opCryptCallback()
+		if err != nil {
+			return 0, nil, nil, err
+		}
+
+		b, _ = p.recvPackets(12)
+		b, _ = p.recvPackets(4)
+
+	}
 	for bytes_to_bint32(b) == op_response && p.lazyResponseCount > 0 {
 		p.lazyResponseCount--
 		_, _, _, _ = p._parse_op_response()
@@ -1274,6 +1392,7 @@ func (p *wireProtocol) paramsToBlr(transHandle int32, params []driver.Value, pro
 	for _, param := range params {
 		switch f := param.(type) {
 		case string:
+			f = p.encodeString(f)
 			b := str_to_bytes(f)
 			if len(b) < MAX_CHAR_LENGTH {
 				blr, v = _bytesToBlr(b)
@@ -1376,4 +1495,127 @@ func (p *wireProtocol) opCancelEvents(eventID int32) {
 	p.packInt(p.dbHandle)
 	p.packInt(eventID)
 	p.sendPackets()
+}
+
+func (p *wireProtocol) opCancel(kind int) error {
+	p.debugPrint("opCancel")
+	p.packInt(op_cancel)
+	p.packInt(int32(kind))
+	_, err := p.sendPackets()
+	return err
+}
+
+func (p *wireProtocol) encodeString(str string) string {
+	switch p.charset {
+	case "OCTETS":
+		return str
+	case "UNICODE_FSS", "UTF8":
+		return str
+	case "SJIS_0208":
+		enc := japanese.ShiftJIS.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "EUCJ_0208":
+		enc := japanese.EUCJP.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "ISO8859_1":
+		enc := charmap.ISO8859_1.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "ISO8859_2":
+		enc := charmap.ISO8859_2.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "ISO8859_3":
+		enc := charmap.ISO8859_3.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "ISO8859_4":
+		enc := charmap.ISO8859_5.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "ISO8859_5":
+		enc := charmap.ISO8859_5.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "ISO8859_6":
+		enc := charmap.ISO8859_6.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "ISO8859_7":
+		enc := charmap.ISO8859_7.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "ISO8859_8":
+		enc := charmap.ISO8859_8.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "ISO8859_9":
+		enc := charmap.ISO8859_9.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "ISO8859_13":
+		enc := charmap.ISO8859_13.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "KSC_5601":
+		enc := korean.EUCKR.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "WIN1250":
+		enc := charmap.Windows1250.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "WIN1251":
+		enc := charmap.Windows1251.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "WIN1252":
+		enc := charmap.Windows1252.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "WIN1253":
+		enc := charmap.Windows1252.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "WIN1254":
+		enc := charmap.Windows1252.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "BIG_5":
+		enc := traditionalchinese.Big5.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "GB_2312":
+		enc := simplifiedchinese.HZGB2312.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "WIN1255":
+		enc := charmap.Windows1255.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "WIN1256":
+		enc := charmap.Windows1256.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "WIN1257":
+		enc := charmap.Windows1257.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "KOI8R":
+		enc := charmap.KOI8R.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "KOI8U":
+		enc := charmap.KOI8U.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	case "WIN1258":
+		enc := charmap.Windows1258.NewEncoder()
+		v, _ := enc.String(str)
+		return v
+	default:
+		return str // If the specified charset is not supported, return the input string without any modification or encoding.
+	}
 }

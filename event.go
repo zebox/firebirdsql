@@ -1,3 +1,4 @@
+//go:build !plan9
 // +build !plan9
 
 /*******************************************************************************
@@ -39,7 +40,7 @@ var (
 	ErrFbEventClosed    = errors.New("fbevent already closed")
 )
 
-//SQLs
+// SQLs
 const (
 	sqlPostEvent = `execute block as begin post_event '%s'; end`
 )

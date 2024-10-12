@@ -24,11 +24,14 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 package firebirdsql
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
-	"github.com/shopspring/decimal"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"math/big"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -39,6 +42,31 @@ import (
 	"time"
 )
 
+var (
+	longQueryNonSelectable = `
+		execute block
+		as
+		declare c integer = 0;
+		begin
+		while (c < 9000000000 ) do
+			begin
+				c = c + 1;
+			end
+		end`
+
+	longQuerySelectable = `
+		execute block returns (i integer) as declare c integer = 0;
+		begin
+		i = 0;
+		while (c < 9000000000 ) do
+			begin
+				c = c + 1;
+				i = c;
+				suspend;
+			end
+		end`
+)
+
 func get_firebird_major_version(conn *sql.DB) int {
 	var s string
 	conn.QueryRow("SELECT rdb$get_context('SYSTEM', 'ENGINE_VERSION') from rdb$database").Scan(&s)
@@ -46,7 +74,7 @@ func get_firebird_major_version(conn *sql.DB) int {
 	return major_version
 }
 
-func TempFileName(prefix string) string {
+func GetTestDSN(prefix string) string {
 	var tmppath string
 	randBytes := make([]byte, 16)
 	rand.Read(randBytes)
@@ -56,25 +84,23 @@ func TempFileName(prefix string) string {
 		tmppath = "/" + tmppath
 	}
 
-	return tmppath
-}
-
-func GetTestDSN(file string) string {
-
-	retorno := "sysdba:masterkey@localhost:3050"
-
-	if runtime.GOOS == "windows" {
-		retorno = retorno + "/"
+	test_user := "sysdba"
+	if isc_user := os.Getenv("ISC_USER"); isc_user != "" {
+		test_user = isc_user
 	}
 
-	retorno = retorno + TempFileName(file)
+	test_password := "masterkey"
+	if isc_password := os.Getenv("ISC_PASSWORD"); isc_password != "" {
+		test_password = isc_password
+	}
 
-	return retorno
+	retorno := test_user + ":" + test_password + "@localhost:3050"
+	return retorno + tmppath
 }
 
 func TestBasic(t *testing.T) {
-	temppath := TempFileName("test_basic_")
-	conn, err := sql.Open("firebirdsql_createdb", "SYSDBA:masterkey@localhost:3050"+temppath)
+	test_dsn := GetTestDSN("test_basic_")
+	conn, err := sql.Open("firebirdsql_createdb", test_dsn)
 
 	if err != nil {
 		t.Fatalf("Error connecting: %v", err)
@@ -111,7 +137,7 @@ func TestBasic(t *testing.T) {
 
 	time.Sleep(1 * time.Second)
 
-	conn, err = sql.Open("firebirdsql", "SYSDBA:masterkey@localhost:3050"+temppath)
+	conn, err = sql.Open("firebirdsql", test_dsn)
 	_, err = conn.Exec("CREATE TABLE foo (a INTEGER)")
 	if err == nil {
 		t.Fatalf("Need metadata update error")
@@ -138,6 +164,7 @@ func TestBasic(t *testing.T) {
 	if !reflect.DeepEqual(columns, []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"}) {
 		t.Fatalf("Columns() mismatch: %v", columns)
 	}
+
 	var a int
 	var b, c string
 	var d float64
@@ -150,7 +177,7 @@ func TestBasic(t *testing.T) {
 
 	for rows.Next() {
 		rows.Scan(&a, &b, &c, &d, &e, &f, &g, &h, &i, &j)
-		//		fmt.Println(a, b, c, d, e, f, g, h, i, j)
+		// fmt.Println(a, b, c, d, e, f, g, h, i, j)
 	}
 
 	stmt, _ := conn.Prepare("select count(*) from foo where a=? and b=? and d=? and e=? and f=? and g=?")
@@ -165,12 +192,100 @@ func TestBasic(t *testing.T) {
 		t.Fatalf("Error bad record count: %v", n)
 	}
 
+	// Issue #169
+	stmt, _ = conn.Prepare("select * from foo where a=?")
+	for k := 1; k < 5; k++ {
+		rows, err := stmt.Query(k)
+		require.NoError(t, err)
+		rows.Next()
+		err = rows.Close()
+		require.NoError(t, err)
+	}
+
+	// Issue #174
+	// https://github.com/nakagami/firebirdsql/issues/174#issue-2312621571
+	stmt1, err := conn.Prepare("select * from foo where a=?")
+	require.NoError(t, err)
+
+	stmt2, err := conn.Prepare("select * from foo where a=?")
+	require.NoError(t, err)
+	for k := 0; k < 3; k++ {
+		rows1, err := stmt1.Query(k)
+		require.NoError(t, err)
+
+		rows2, err := stmt2.Query(1)
+		require.NoError(t, err)
+
+		err = rows1.Close()
+		require.NoError(t, err)
+
+		err = rows2.Close()
+		require.NoError(t, err)
+	}
+
+	err = stmt1.Close()
+	require.NoError(t, err)
+
+	err = stmt2.Close()
+	require.NoError(t, err)
+
+	// https://github.com/nakagami/firebirdsql/issues/174#issuecomment-2134693366
+	stmt, err = conn.Prepare("select * from foo where a=?")
+	require.NoError(t, err)
+
+	tx, err := conn.Begin()
+	require.NoError(t, err)
+	err = tx.Commit()
+	require.NoError(t, err)
+
+	rows, err = stmt.Query(1)
+	require.NoError(t, err)
+
+	rows.Close()
+	require.NoError(t, err)
+
+	// https://github.com/nakagami/firebirdsql/issues/174#issuecomment-2139296394
+	// START TX1
+	tx, err = conn.Begin()
+	require.NoError(t, err)
+
+	stmt1, err = conn.Prepare(`select * from foo where a=?`)
+	require.NoError(t, err)
+	rows1, err := tx.Stmt(stmt1).Query(1)
+	require.NoError(t, err)
+	err = rows1.Close()
+	require.NoError(t, err)
+	err = stmt1.Close()
+	require.NoError(t, err)
+
+	stmt2, err = conn.Prepare(`select * from foo where a=?`)
+	require.NoError(t, err)
+	_, err = tx.Stmt(stmt2).Exec(333)
+	require.NoError(t, err)
+
+	err = tx.Commit()
+	require.NoError(t, err)
+	// END TX1
+
+	// START TX2
+	tx, err = conn.Begin()
+	require.NoError(t, err)
+	_, err = tx.Stmt(stmt2).Exec(333)
+	require.NoError(t, err)
+	err = tx.Rollback()
+	require.NoError(t, err)
+	// END TX2
+
+	err = conn.Close()
+	require.NoError(t, err)
+	// Issue #174 end
+
 	conn.Close()
 }
 
 func TestReturning(t *testing.T) {
-	temppath := TempFileName("test_returning_")
-	conn, err := sql.Open("firebirdsql_createdb", "SYSDBA:masterkey@localhost:3050"+temppath)
+	test_dsn := GetTestDSN("test_returning_")
+	conn, err := sql.Open("firebirdsql_createdb", test_dsn)
 	if err != nil {
 		t.Fatalf("Error sql.Open() : %v", err)
 	}
@@ -185,7 +300,7 @@ func TestReturning(t *testing.T) {
 
 	time.Sleep(1 * time.Second)
 
-	conn, err = sql.Open("firebirdsql", "SYSDBA:masterkey@localhost:3050"+temppath)
+	conn, err = sql.Open("firebirdsql", test_dsn)
 	if err != nil {
 		t.Fatalf("Error sql.Open() : %v", err)
 	}
@@ -208,14 +323,14 @@ func TestReturning(t *testing.T) {
 }
 
 func TestInsertBlobsWithParams(t *testing.T) {
-	temppath := TempFileName("test_insert_blobs_with_params")
-	conn, _ := sql.Open("firebirdsql_createdb", "SYSDBA:masterkey@localhost:3050"+temppath)
+	test_dsn := GetTestDSN("test_insert_blobs_with_params")
+	conn, _ := sql.Open("firebirdsql_createdb", test_dsn)
 	conn.Exec("CREATE TABLE test_blobs (f1 BLOB SUB_TYPE 0, f2 BLOB SUB_TYPE 1)")
 	conn.Close()
 
 	time.Sleep(1 * time.Second)
 
-	conn, _ = sql.Open("firebirdsql", "SYSDBA:masterkey@localhost:3050"+temppath)
+	conn, _ = sql.Open("firebirdsql", test_dsn)
 
 	s0 := "Test Text"
 	b0 := []byte{0, 1, 2, 3, 4, 13, 10, 5, 6, 7}
@@ -240,8 +355,7 @@ func TestInsertBlobsWithParams(t *testing.T) {
 }
 
 func TestError(t *testing.T) {
-	temppath := TempFileName("test_error_")
-	conn, err := sql.Open("firebirdsql_createdb", "SYSDBA:masterkey@localhost:3050"+temppath)
+	conn, err := sql.Open("firebirdsql_createdb", GetTestDSN("test_error_"))
 	if err != nil {
 		t.Fatalf("Error connecting: %v", err)
 	}
@@ -255,8 +369,8 @@ func TestError(t *testing.T) {
 }
 
 func TestRole(t *testing.T) {
-	temppath := TempFileName("test_role_")
-	conn1, err := sql.Open("firebirdsql_createdb", "SYSDBA:masterkey@localhost:3050"+temppath)
+	test_dsn := GetTestDSN("test_role_")
+	conn1, err := sql.Open("firebirdsql_createdb", test_dsn)
 	if err != nil {
 		t.Fatalf("Error creating: %v", err)
 	}
@@ -278,7 +392,7 @@ func TestRole(t *testing.T) {
 
 	time.Sleep(1 * time.Second)
 
-	conn2, err := sql.Open("firebirdsql", "SYSDBA:masterkey@localhost:3050"+temppath+"?role=driverrole")
+	conn2, err := sql.Open("firebirdsql", test_dsn+"?role=driverrole")
 	if err != nil {
 		t.Fatalf("Error connecting: %v", err)
 	}
@@ -294,9 +408,7 @@ func TestRole(t *testing.T) {
 }
 
 func TestInsertTimestamp(t *testing.T) {
-	temppath := TempFileName("test_timestamp_")
-
-	conn, err := sql.Open("firebirdsql_createdb", "SYSDBA:masterkey@localhost:3050"+temppath)
+	conn, err := sql.Open("firebirdsql_createdb", GetTestDSN("test_timestamp_"))
 	if err != nil {
 		t.Fatalf("Error creating: %v", err)
 	}
@@ -337,9 +449,7 @@ func TestInsertTimestamp(t *testing.T) {
 }
 
 func TestBoolean(t *testing.T) {
-	temppath := TempFileName("test_boolean_")
-
-	conn, err := sql.Open("firebirdsql_createdb", "SYSDBA:masterkey@localhost:3050"+temppath)
+	conn, err := sql.Open("firebirdsql_createdb", GetTestDSN("test_boolean_"))
 	if err != nil {
 		t.Fatalf("Error connecting: %v", err)
 	}
@@ -398,9 +508,7 @@ func TestBoolean(t *testing.T) {
 }
 
 func TestDecFloat(t *testing.T) {
-	temppath := TempFileName("test_decfloat_")
-
-	conn, err := sql.Open("firebirdsql_createdb", "SYSDBA:masterkey@localhost:3050"+temppath)
+	conn, err := sql.Open("firebirdsql_createdb", GetTestDSN("test_decfloat_"))
 	if err != nil {
 		t.Fatalf("Error connecting: %v", err)
 	}
@@ -410,20 +518,21 @@ func TestDecFloat(t *testing.T) {
 		return
 	}
 
-	sql := `
+	query := `
         CREATE TABLE test_decfloat (
             i integer,
             d DECIMAL(20, 2),
-            df64 DECFLOAT(16),
-            df128 DECFLOAT(34)
+            df16 DECFLOAT(16),
+            df34 DECFLOAT(34),
+            s varchar(32)
         )
     `
-	conn.Exec(sql)
-	conn.Exec("insert into test_decfloat(i, d, df64, df128) values (1, 0.0, 0.0, 0.0)")
-	conn.Exec("insert into test_decfloat(i, d, df64, df128) values (2, 1.0, 1.0, 1.0)")
-	conn.Exec("insert into test_decfloat(i, d, df64, df128) values (3, 20.0, 20.0, 20.0)")
-	conn.Exec("insert into test_decfloat(i, d, df64, df128) values (4, -1.0, -1.0, -1.0)")
-	conn.Exec("insert into test_decfloat(i, d, df64, df128) values (5, -20.0, -20.0, -20.0)")
+	conn.Exec(query)
+	conn.Exec("insert into test_decfloat(i, d, df16, df34, s) values (1, 0.0, 0.0, 0.0, '0.0')")
+	conn.Exec("insert into test_decfloat(i, d, df16, df34, s) values (2, 1.1, 1.1, 1.1, '1.1')")
+	conn.Exec("insert into test_decfloat(i, d, df16, df34, s) values (3, 120.2, 120.2, 120.2, '120.2')")
+	conn.Exec("insert into test_decfloat(i, d, df16, df34, s) values (4, -1.1, -1.1, -1.1, '-1.1')")
+	conn.Exec("insert into test_decfloat(i, d, df16, df34, s) values (5, -120.2, -120.2, -120.2, '-120.2')")
 
 	var n int
 	err = conn.QueryRow("select count(*) cnt from test_decfloat").Scan(&n)
@@ -434,20 +543,143 @@ func TestDecFloat(t *testing.T) {
 		t.Fatalf("Error bad record count: %v", n)
 	}
 
-	rows, err := conn.Query("select d, df64, df128 from test_decfloat order by i")
+	rows, err := conn.Query("select df16, df34, s from test_decfloat order by i")
 
-	var d, df64, df128 decimal.Decimal
+	var df16, df34 sql.NullFloat64
+	var s string
 	for rows.Next() {
-		rows.Scan(&d, &df64, &df128)
+		rows.Scan(&df16, &df34, &s)
+		f, _ := strconv.ParseFloat(s, 64)
+		df16v, _ := df16.Value()
+		df34v, _ := df34.Value()
+
+		if df16v != f || df34v != f {
+			fmt.Printf("Error decfloat value : %v,%v,%v\n", df16v, df34v, f)
+		}
+	}
+
+	conn.Close()
+}
+
+func TestTimeZone(t *testing.T) {
+	conn, err := sql.Open("firebirdsql_createdb", GetTestDSN("test_timezone_")+"?timezone=Asia/Tokyo")
+	if err != nil {
+		t.Fatalf("Error connecting: %v", err)
+	}
+
+	firebird_major_version := get_firebird_major_version(conn)
+	if firebird_major_version < 4 {
+		return
+	}
+
+	sql := `
+            CREATE TABLE test_timezone (
+                id INTEGER NOT NULL,
+                a TIME WITH TIME ZONE DEFAULT '12:34:56',
+                b TIMESTAMP WITH TIME ZONE DEFAULT '1967-08-11 23:45:01',
+                PRIMARY KEY (id)
+            )
+    `
+	conn.Exec(sql)
+	conn.Exec("insert into test_timezone (id) values (0)")
+	conn.Exec("insert into test_timezone (id, a, b) values (1, '12:34:56 Asia/Seoul', '1967-08-11 23:45:01.0000 Asia/Seoul')")
+	conn.Exec("insert into test_timezone (id, a, b) values (2, '03:34:56 UTC', '1967-08-11 14:45:01.0000 UTC')")
+
+	var id int
+	var a time.Time
+	var b time.Time
+	rows, _ := conn.Query("select * from test_timezone")
+	expected := []string{
+		"0000-01-01 12:34:56 +0900 JST, 1967-08-11 23:45:01 +0900 JST",
+		"0000-01-01 12:34:56 +0900 KST, 1967-08-11 23:45:01 +0900 KST",
+		"0000-01-01 03:34:56 +0000 UTC, 1967-08-11 14:45:01 +0000 UTC"}
+
+	for rows.Next() {
+		rows.Scan(&id, &a, &b)
+		s := fmt.Sprintf("%v, %v", a, b)
+		if s != expected[id] {
+			t.Fatalf("Incorrect result: %v", s)
+		}
+	}
+
+	conn.Close()
+}
+
+func TestInt128(t *testing.T) {
+	// https://github.com/nakagami/firebirdsql/issues/129
+	conn, err := sql.Open("firebirdsql_createdb", GetTestDSN("test_int128_"))
+	if err != nil {
+		t.Fatalf("Error connecting: %v", err)
+	}
+
+	firebird_major_version := get_firebird_major_version(conn)
+	if firebird_major_version < 4 {
+		return
+	}
+
+	sql := `
+        CREATE TABLE test_int128 (
+            i int128
+        )
+    `
+	conn.Exec(sql)
+	conn.Exec("insert into test_int128(i) values (170141183460469231731687303715884105727)")
+
+	var i128 *big.Int
+	err = conn.QueryRow("SELECT i FROM test_int128").Scan(&i128)
+	if err != nil {
+		t.Fatalf("Error SELECT: %v", err)
+	}
+
+	var toCmp = new(big.Int)
+	toCmp, _ = toCmp.SetString("170141183460469231731687303715884105727", 10)
+
+	if i128.Cmp(toCmp) != 0 {
+		t.Fatalf("INT128 Error: %v", i128)
+	}
+
+	conn.Close()
+}
+
+func TestNegativeInt128(t *testing.T) {
+	conn, err := sql.Open("firebirdsql_createdb", GetTestDSN("test_negative_int128_"))
+	if err != nil {
+		t.Fatalf("Error connecting: %v", err)
+	}
+
+	firebird_major_version := get_firebird_major_version(conn)
+	if firebird_major_version < 4 {
+		return
+	}
+
+	sql := `
+        CREATE TABLE test_negative_int128 (
+            i int128
+        )
+    `
+	conn.Exec(sql)
+	conn.Exec("insert into test_negative_int128(i) values (-170141183460469231731687303715884105727)")
+
+	var i128 *big.Int
+	err = conn.QueryRow("SELECT i FROM test_negative_int128").Scan(&i128)
+	if err != nil {
+		t.Fatalf("Error SELECT: %v", err)
+	}
+
+	var toCmp = new(big.Int)
+	toCmp, _ = toCmp.SetString("-170141183460469231731687303715884105727", 10)
+
+	if i128.Cmp(toCmp) != 0 {
+		t.Fatalf("Negative INT128 Error: %v", i128)
 	}
 
 	conn.Close()
 }
 
 func TestLegacyAuthWireCrypt(t *testing.T) {
-	temppath := TempFileName("test_legacy_atuh_")
+	test_dsn := GetTestDSN("test_legacy_auth_")
 	var n int
-	conn, err := sql.Open("firebirdsql_createdb", "SYSDBA:masterkey@localhost:3050"+temppath)
+	conn, err := sql.Open("firebirdsql_createdb", test_dsn)
 	if err != nil {
 		t.Fatalf("Error connecting: %v", err)
 	}
@@ -459,7 +691,7 @@ func TestLegacyAuthWireCrypt(t *testing.T) {
 
 	time.Sleep(1 * time.Second)
 
-	conn, err = sql.Open("firebirdsql", "SYSDBA:masterkey@localhost:3050"+temppath+"?auth_plugin_anme=Legacy_Auth")
+	conn, err = sql.Open("firebirdsql", test_dsn+"?auth_plugin_anme=Legacy_Auth")
 	if err != nil {
 		t.Fatalf("Error connecting: %v", err)
 	}
@@ -469,7 +701,7 @@ func TestLegacyAuthWireCrypt(t *testing.T) {
 	}
 	conn.Close()
 
-	conn, err = sql.Open("firebirdsql", "SYSDBA:masterkey@localhost:3050"+temppath+"?wire_crypt=false")
+	conn, err = sql.Open("firebirdsql", test_dsn+"?wire_crypt=false")
 	if err != nil {
 		t.Fatalf("Error connecting: %v", err)
 	}
@@ -479,7 +711,7 @@ func TestLegacyAuthWireCrypt(t *testing.T) {
 	}
 	conn.Close()
 
-	conn, err = sql.Open("firebirdsql", "SYSDBA:masterkey@localhost:3050"+temppath+"?auth_plugin_name=Legacy_Auth&wire_auth=true")
+	conn, err = sql.Open("firebirdsql", test_dsn+"?auth_plugin_name=Legacy_Auth&wire_auth=true")
 	if err != nil {
 		t.Fatalf("Error connecting: %v", err)
 	}
@@ -489,7 +721,7 @@ func TestLegacyAuthWireCrypt(t *testing.T) {
 	}
 	conn.Close()
 
-	conn, err = sql.Open("firebirdsql", "SYSDBA:masterkey@localhost:3050"+temppath+"?auth_plugin_name=Legacy_Auth&wire_auth=false")
+	conn, err = sql.Open("firebirdsql", test_dsn+"?auth_plugin_name=Legacy_Auth&wire_auth=false")
 	if err != nil {
 		t.Fatalf("Error connecting: %v", err)
 	}
@@ -524,8 +756,8 @@ func TestGoIssue44(t *testing.T) {
 }
 
 func TestGoIssue45(t *testing.T) {
-	temppath := TempFileName("test_issue45_")
-	conn, err := sql.Open("firebirdsql_createdb", "SYSDBA:masterkey@localhost:3050"+temppath)
+	test_dsn := GetTestDSN("test_issue45_")
+	conn, err := sql.Open("firebirdsql_createdb", test_dsn)
 	if err != nil {
 		t.Fatalf("Error occured at sql.Open()")
 	}
@@ -545,7 +777,7 @@ func TestGoIssue45(t *testing.T) {
 
 	time.Sleep(1 * time.Second)
 
-	conn, err = sql.Open("firebirdsql", "SYSDBA:masterkey@localhost:3050"+temppath)
+	conn, err = sql.Open("firebirdsql", test_dsn)
 
 	// select null value
 	type response struct {
@@ -595,8 +827,8 @@ func TestGoIssue45(t *testing.T) {
 }
 
 func TestGoIssue49(t *testing.T) {
-	temppath := TempFileName("test_issue49_")
-	conn, err := sql.Open("firebirdsql_createdb", "SYSDBA:masterkey@localhost:3050"+temppath)
+	test_dsn := GetTestDSN("test_issue49_")
+	conn, err := sql.Open("firebirdsql_createdb", test_dsn)
 	if err != nil {
 		t.Fatalf("Error occured at sql.Open()")
 	}
@@ -656,8 +888,8 @@ func TestGoIssue49(t *testing.T) {
 
 func TestGoIssue53(t *testing.T) {
 	timeout := time.Second * 40
-	temppath := TempFileName("test_issue53_")
-	conn, err := sql.Open("firebirdsql_createdb", "SYSDBA:masterkey@localhost:3050"+temppath)
+	test_dsn := GetTestDSN("test_issue53_")
+	conn, err := sql.Open("firebirdsql_createdb", test_dsn)
 	if err != nil {
 		t.Fatalf("Error occured at sql.Open()")
 	}
@@ -724,9 +956,8 @@ func TestGoIssue53(t *testing.T) {
 	}
 }
 func TestGoIssue65(t *testing.T) {
-
-	temppath := TempFileName("test_issue65_")
-	conn, err := sql.Open("firebirdsql_createdb", "SYSDBA:masterkey@localhost:3050"+temppath)
+	test_dsn := GetTestDSN("test_issue65_")
+	conn, err := sql.Open("firebirdsql_createdb", test_dsn)
 	if err != nil {
 		t.Fatalf("Error occured at sql.Open()")
 	}
@@ -788,8 +1019,8 @@ func TestGoIssue65(t *testing.T) {
 }
 
 func TestGoIssue80(t *testing.T) {
-	temppath := TempFileName("test_issue80_")
-	conn, err := sql.Open("firebirdsql_createdb", "SYSDBA:masterkey@localhost:3050"+temppath)
+	test_dsn := GetTestDSN("test_issue80_")
+	conn, err := sql.Open("firebirdsql_createdb", test_dsn)
 	if err != nil {
 		t.Fatalf("Error occured at sql.Open()")
 	}
@@ -830,13 +1061,11 @@ func TestGoIssue80(t *testing.T) {
 }
 
 func TestIssue96(t *testing.T) {
-	temppath := TempFileName("test_issue96_")
-
-	conn, err := sql.Open("firebirdsql_createdb", "SYSDBA:masterkey@localhost:3050"+temppath)
+	test_dsn := GetTestDSN("test_issue96_")
+	conn, err := sql.Open("firebirdsql_createdb", test_dsn)
 	if err != nil {
 		t.Fatalf("Error connecting: %v", err)
 	}
-	firebird_major_version := get_firebird_major_version(conn)
 
 	conn.Exec(`CREATE EXCEPTION EX_DATA_ERROR ''`)
 	conn.Exec(`CREATE PROCEDURE EXCEPTION_PROC(in1 INTEGER)
@@ -853,28 +1082,22 @@ func TestIssue96(t *testing.T) {
 
 	query := "SELECT * FROM exception_proc(1)"
 	rows, err := conn.Query(query)
-	if firebird_major_version < 4 {
-		if err != nil {
-			t.Fatalf("Error Query: %v", err)
-		}
-		rows.Next()
-		var n int
-		err = rows.Scan(&n)
-		if err == nil {
-			t.Error("Error not occured")
-		}
-	} else {
-		if err == nil {
-			t.Error("Error not occured")
-		}
+	if err != nil {
+		t.Fatalf("Error Query: %v", err)
+	}
+	rows.Next()
+	var n int
+	err = rows.Scan(&n)
+	if err == nil {
+		t.Error("Error not occured")
 	}
 
 	conn.Close()
 }
 
 func TestGoIssue112(t *testing.T) {
-	temppath := TempFileName("test_issue112_")
-	conn, err := sql.Open("firebirdsql_createdb", "SYSDBA:masterkey@localhost:3050"+temppath)
+	test_dsn := GetTestDSN("test_issue112_")
+	conn, err := sql.Open("firebirdsql_createdb", test_dsn)
 	if err != nil {
 		t.Fatalf("Error occured at sql.Open()")
 	}
@@ -906,4 +1129,270 @@ func TestGoIssue112(t *testing.T) {
 		t.Fatalf("%v != %v", input_val, output_val)
 	}
 
+}
+
+func TestGoIssue134(t *testing.T) {
+	test_dsn := GetTestDSN("test_issue134_")
+	conn, err := sql.Open("firebirdsql_createdb", test_dsn)
+	if err != nil {
+		t.Fatalf("Error occured at sql.Open()")
+	}
+
+	query := `
+        CREATE TABLE t (
+			text VARCHAR(4)
+        )
+    `
+	_, err = conn.Exec(query)
+	if err != nil {
+		t.Error(err)
+	}
+
+	conn.Exec("INSERT INTO t(text) VALUES ('café')")
+	if err != nil {
+		t.Fatalf("Error Insert : %v", err)
+	}
+
+	rows, err := conn.Query("select text from t")
+	if err != nil {
+		t.Error(err)
+	}
+	rows.Next()
+	var text string
+	err = rows.Scan(&text)
+	if err != nil {
+		t.Error(err)
+	}
+
+	if text != "café" {
+		t.Fatalf("Error bad record : %v", text)
+	}
+
+}
+
+func TestGoIssue117(t *testing.T) {
+	testDsn := GetTestDSN("test_issue117_")
+	conn, err := sql.Open("firebirdsql_createdb", testDsn)
+	require.NoError(t, err)
+
+	query := `CREATE TABLE t (text CHAR(16))`
+	_, err = conn.Exec(query)
+	require.NoError(t, err)
+
+	_, err = conn.Exec("INSERT INTO t VALUES ('test')")
+	require.NoError(t, err)
+
+	rows, err := conn.Query("select text from t")
+	require.NoError(t, err)
+
+	var text string
+	require.True(t, rows.Next())
+	require.NoError(t, rows.Scan(&text))
+	assert.Equal(t, "test", text)
+	require.NoError(t, rows.Close())
+
+	rows, err = conn.Query("select 'test' from rdb$database")
+	require.NoError(t, err)
+
+	require.True(t, rows.Next())
+	require.NoError(t, rows.Scan(&text))
+	assert.Equal(t, "test", text)
+	require.NoError(t, rows.Close())
+}
+
+func TestGoIssue164(t *testing.T) {
+	testDsn := GetTestDSN("test_issue164_") + "?charset=WIN1251"
+	conn, err := sql.Open("firebirdsql_createdb", testDsn)
+	require.NoError(t, err)
+
+	query := `CREATE TABLE t (text CHAR(2))`
+	_, err = conn.Exec(query)
+	require.NoError(t, err)
+
+	_, err = conn.Exec("INSERT INTO t VALUES ('Б')")
+	require.NoError(t, err)
+
+	rows, err := conn.Query("select text from t")
+	require.NoError(t, err)
+
+	var text string
+	require.True(t, rows.Next())
+	require.NoError(t, rows.Scan(&text))
+	assert.Equal(t, "Б", text)
+	require.NoError(t, rows.Close())
+
+	var text2 string
+	stmt, err := conn.Prepare("select text from t where text=?")
+	require.NoError(t, err)
+	err = stmt.QueryRow(text).Scan(&text2)
+	require.NoError(t, err)
+	assert.Equal(t, "Б", text2)
+}
+
+func TestGoIssue170(t *testing.T) {
+	testDsn := GetTestDSN("test_issue170") + "?charset=None"
+	conn, err := sql.Open("firebirdsql_createdb", testDsn)
+	require.NoError(t, err)
+
+	query := `
+        CREATE TABLE T2 (
+            ENTERO_NN INTEGER NOT NULL,
+            ENTERO INTEGER,
+            TEXTO_NN VARCHAR(30) NOT NULL,
+            TEXTO VARCHAR(3000),
+            FECHA_NN DATE NOT NULL,
+            FECHA DATE,
+            HORA_NN TIME NOT NULL,
+            HORA TIME,
+            MOMENTO_NN TIMESTAMP NOT NULL,
+            MOMENTO TIMESTAMP,
+            MEMO BLOB SUB_TYPE TEXT,
+            BINARIO BLOB SUB_TYPE BINARY,
+            SIMPLE_NN FLOAT NOT NULL,
+            SIMPLE FLOAT,
+            DOBLE_NN DOUBLE PRECISION NOT NULL,
+            DOBLE DOUBLE PRECISION,
+            LETRAS_NN CHAR(30) NOT NULL,
+            LETRAS CHAR(30),
+            CONSTRAINT PK_T2 PRIMARY KEY (ENTERO_NN)
+        )
+	`
+	_, err = conn.Exec(query)
+	require.NoError(t, err)
+
+	_, err = conn.Exec(`
+        INSERT INTO T2
+        (ENTERO_NN, ENTERO, TEXTO_NN, TEXTO, FECHA_NN, FECHA, HORA_NN, HORA, MOMENTO_NN, MOMENTO, MEMO, BINARIO, SIMPLE_NN, SIMPLE, DOBLE_NN, DOBLE, LETRAS_NN, LETRAS)
+        VALUES(1, 1, 'uno', 'uno', '2024-06-04', '2024-06-04', '12:50:00', '12:50:00', '2024-06-04 12:50:00', '2024-06-04 12:50:00', 'memo', NULL, 1234.0, 1234.0, 12345678, 12345678, 'HOLA', 'ESCAROLA')
+	`)
+	require.NoError(t, err)
+	_, err = conn.Exec(`
+INSERT INTO T2
+(ENTERO_NN, ENTERO, TEXTO_NN, TEXTO, FECHA_NN, FECHA, HORA_NN, HORA, MOMENTO_NN, MOMENTO, MEMO, BINARIO, SIMPLE_NN, SIMPLE, DOBLE_NN, DOBLE, LETRAS_NN, LETRAS)
+VALUES(2, NULL, 'dos', NULL, '2024-06-04', NULL, '12:50:00', NULL, '2024-06-04 12:50:00', NULL, NULL, NULL, 1234.0, NULL, 12345678, NULL, 'HOLA', NULL);
+	`)
+	require.NoError(t, err)
+
+	rows, err := conn.Query("select * from T2")
+	require.NoError(t, err)
+
+	rows.Next()
+
+	rows.Close()
+	conn.Close()
+}
+
+func TestGoIssue172(t *testing.T) {
+	testDsn := GetTestDSN("test_constraint_type_")
+	conn, err := sql.Open("firebirdsql_createdb", testDsn)
+	require.NoError(t, err)
+	firebird_major_version := get_firebird_major_version(conn)
+	if firebird_major_version < 3 {
+		return
+	}
+
+	rows, err := conn.Query("select RDB$CONSTRAINT_TYPE from RDB$RELATION_CONSTRAINTS")
+	require.NoError(t, err)
+
+	var text string
+	require.True(t, rows.Next())
+	require.NoError(t, rows.Scan(&text))
+	require.NoError(t, rows.Close())
+}
+
+func TestKSC_5601(t *testing.T) {
+	testDsn := GetTestDSN("test_KSC_5601_") + "?charset=KSC_5601"
+	conn, err := sql.Open("firebirdsql_createdb", testDsn)
+	require.NoError(t, err)
+
+	query := `CREATE TABLE t (text CHAR(6))`
+	_, err = conn.Exec(query)
+	require.NoError(t, err)
+
+	_, err = conn.Exec("INSERT INTO t VALUES ('안녕하세요.')")
+	require.NoError(t, err)
+
+	rows, err := conn.Query("SELECT text FROM t")
+	require.NoError(t, err)
+
+	var text string
+	require.True(t, rows.Next())
+	require.NoError(t, rows.Scan(&text))
+	assert.Equal(t, "안녕하세요.", text)
+	require.NoError(t, rows.Close())
+
+	_, err = conn.Exec("INSERT INTO t VALUES (?)", "안녕하세요.")
+	require.NoError(t, err)
+
+	rows, err = conn.Query("SELECT text FROM t")
+	require.NoError(t, err)
+
+	require.True(t, rows.Next())
+	require.NoError(t, rows.Scan(&text))
+	assert.Equal(t, "안녕하세요.", text)
+	require.NoError(t, rows.Close())
+}
+
+func TestTimeoutQueryContextDuringScan(t *testing.T) {
+	testDsn := GetTestDSN("test_timeout_query_context_scan_")
+	conn, err := sql.Open("firebirdsql_createdb", testDsn)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
+	defer cancel()
+
+	rows, err := conn.QueryContext(ctx, longQuerySelectable)
+	require.NoError(t, err)
+
+	var n int
+	for rows.Next() {
+		if err := rows.Scan(&n); err != nil {
+			break
+		}
+	}
+
+	// rows.Next or rows.Scan should fail with timeout
+	if err == nil {
+		err = rows.Err()
+	}
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+func TestTimeoutQueryContextDuringExec(t *testing.T) {
+	testDsn := GetTestDSN("test_timeout_query_context_exec_")
+	conn, err := sql.Open("firebirdsql_createdb", testDsn)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
+	defer cancel()
+	_, err = conn.QueryContext(ctx, longQueryNonSelectable)
+	assert.EqualError(t, err, "operation was cancelled\n")
+	assert.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
+}
+
+func TestTimeoutExecContext(t *testing.T) {
+	testDsn := GetTestDSN("test_timeout_exec_context_")
+	conn, err := sql.Open("firebirdsql_createdb", testDsn)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
+	defer cancel()
+	_, err = conn.ExecContext(ctx, longQueryNonSelectable)
+	assert.EqualError(t, err, "operation was cancelled\n")
+	assert.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
+}
+
+func TestReuseConnectionAfterTimeout(t *testing.T) {
+	testDsn := GetTestDSN("test_timeout_conn_reuse_")
+	conn, err := sql.Open("firebirdsql_createdb", testDsn)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
+	defer cancel()
+	_, err = conn.QueryContext(ctx, longQueryNonSelectable)
+	assert.EqualError(t, err, "operation was cancelled\n")
+	assert.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
+
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second*2)
+	defer cancel()
+
+	_, err = conn.QueryContext(ctx, "select * from rdb$database")
+	require.NoError(t, err)
 }

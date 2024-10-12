@@ -26,6 +26,7 @@ package firebirdsql
 import (
 	"bytes"
 	"container/list"
+	"context"
 	"database/sql/driver"
 	"io"
 	"reflect"
@@ -33,14 +34,16 @@ import (
 )
 
 type firebirdsqlRows struct {
+	ctx             context.Context
 	stmt            *firebirdsqlStmt
 	currentChunkRow *list.Element
 	moreData        bool
 	result          []driver.Value
 }
 
-func newFirebirdsqlRows(stmt *firebirdsqlStmt, result []driver.Value) *firebirdsqlRows {
+func newFirebirdsqlRows(ctx context.Context, stmt *firebirdsqlStmt, result []driver.Value) *firebirdsqlRows {
 	rows := new(firebirdsqlRows)
+	rows.ctx = ctx
 	rows.stmt = stmt
 	rows.result = result
 	if stmt.stmtType == isc_info_sql_stmt_select {
@@ -53,7 +56,7 @@ func (rows *firebirdsqlRows) Columns() []string {
 	columns := make([]string, len(rows.stmt.xsqlda))
 	for i, x := range rows.stmt.xsqlda {
 		columns[i] = x.aliasname
-		if rows.stmt.tx.fc.columnNameToLower {
+		if rows.stmt.fc.columnNameToLower {
 			columns[i] = strings.ToLower(columns[i])
 		}
 	}
@@ -67,6 +70,11 @@ func (rows *firebirdsqlRows) Close() (er error) {
 }
 
 func (rows *firebirdsqlRows) Next(dest []driver.Value) (err error) {
+	if rows.ctx.Err() != nil {
+		rows.stmt.fc.wp.opCancel(fb_cancel_raise)
+		return rows.ctx.Err()
+	}
+
 	if rows.stmt.stmtType == isc_info_sql_stmt_exec_procedure {
 		if rows.result != nil {
 			for i, v := range rows.result {
@@ -87,11 +95,11 @@ func (rows *firebirdsqlRows) Next(dest []driver.Value) (err error) {
 	if rows.currentChunkRow == nil && rows.moreData == true {
 		// Get one chunk
 		var chunk *list.List
-		err = rows.stmt.wp.opFetch(rows.stmt.stmtHandle, rows.stmt.blr)
+		err = rows.stmt.fc.wp.opFetch(rows.stmt.stmtHandle, rows.stmt.blr)
 		if err != nil {
 			return err
 		}
-		chunk, rows.moreData, err = rows.stmt.wp.opFetchResponse(rows.stmt.stmtHandle, rows.stmt.tx.transHandle, rows.stmt.xsqlda)
+		chunk, rows.moreData, err = rows.stmt.fc.wp.opFetchResponse(rows.stmt.stmtHandle, rows.stmt.fc.tx.transHandle, rows.stmt.xsqlda)
 
 		if err == nil {
 			rows.currentChunkRow = chunk.Front()
@@ -109,7 +117,7 @@ func (rows *firebirdsqlRows) Next(dest []driver.Value) (err error) {
 		if rows.stmt.xsqlda[i].sqltype == SQL_TYPE_BLOB && v != nil {
 			blobId := v.([]byte)
 			var blob []byte
-			blob, err = rows.stmt.wp.getBlobSegments(blobId, rows.stmt.tx.transHandle)
+			blob, err = rows.stmt.fc.wp.getBlobSegments(blobId, rows.stmt.fc.tx.transHandle)
 			if rows.stmt.xsqlda[i].sqlsubtype == 1 {
 				dest[i] = bytes.NewBuffer(blob).String()
 			} else {
@@ -137,7 +145,7 @@ func (rows *firebirdsqlRows) ColumnTypeNullable(index int) (nullable bool, ok bo
 }
 
 func (rows *firebirdsqlRows) ColumnTypePrecisionScale(index int) (precision, scale int64, ok bool) {
-	return int64(rows.stmt.xsqlda[index].displayLength()), int64(rows.stmt.xsqlda[index].scale()), rows.stmt.xsqlda[index].hasPrecisionScale()
+	return int64(rows.stmt.xsqlda[index].displayLength()), int64(rows.stmt.xsqlda[index].sqlscale), rows.stmt.xsqlda[index].hasPrecisionScale()
 }
 
 func (rows *firebirdsqlRows) ColumnTypeScanType(index int) reflect.Type {

@@ -50,7 +50,7 @@ func pad(v *big.Int) []byte {
 	n = big.NewInt(0)
 	n = n.Add(n, v)
 
-	for i, _ := range buf {
+	for i := range buf {
 		buf[i] = byte(m.And(m.SetInt64(255), n).Int64())
 		n = n.Div(n, m.SetInt64(256))
 	}
@@ -65,6 +65,30 @@ func pad(v *big.Int) []byte {
 	for i = 0; buf[i] == 0; i++ {
 	}
 	return buf[i:]
+}
+
+func bigIntToBytes(v *big.Int) []byte {
+	return pad(v)
+}
+
+func bytesToBigInt(v []byte) (r *big.Int) {
+	m := new(big.Int)
+	m.SetInt64(256)
+	a := new(big.Int)
+	r = new(big.Int)
+	r.SetInt64(0)
+	for _, b := range v {
+		r = r.Mul(r, m)
+		r = r.Add(r, a.SetInt64(int64(b)))
+	}
+	return r
+}
+
+func bigIntToSha1(n *big.Int) []byte {
+	sha1 := sha1.New()
+	sha1.Write(n.Bytes())
+
+	return sha1.Sum(nil)
 }
 
 func getPrime() (prime *big.Int, g *big.Int, k *big.Int) {
@@ -116,7 +140,7 @@ func getClientSeed() (keyA *big.Int, keya *big.Int) {
 func getSalt() []byte {
 	buf := make([]byte, SRP_SALT_SIZE)
 	if DEBUG_SRP == false {
-		for i, _ := range buf {
+		for i := range buf {
 			buf[i] = byte(rand.Intn(256))
 		}
 	}
